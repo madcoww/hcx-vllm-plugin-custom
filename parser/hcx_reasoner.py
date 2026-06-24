@@ -2,12 +2,8 @@
 # Copyright (c) 2025-present NAVER Cloud Corp.
 # Apache-2.0
 
-import re
-
 from collections.abc import Sequence
 from typing import Optional, Union
-
-from transformers import PreTrainedTokenizerBase
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -18,74 +14,51 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 
 from vllm.reasoning import ReasoningParser
-from vllm.logger import init_logger
 
 from .hcx_parser_mixin import HcxStreamingParserFunctionsMixin
 
-logger = init_logger(__name__)
-
 
 class HcxReasoningParser(ReasoningParser, HcxStreamingParserFunctionsMixin):
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
+    """Reasoning parser for the HCX `<think> ... </think>` chat format.
+
+    The chat template injects `<think>` into the generation prompt, so the
+    model output usually *starts* with the reasoning text and is closed by
+    `</think>`; the answer follows. Parsing is therefore a single partition
+    on `</think>`.
+    """
+
+    def __init__(self, tokenizer, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
-        self.think_start_token = "/think\n"
-        self.think_end_string_base = "<|im_end|>\n<|im_start|>assistant"
+        self.think_start_token = "<think>"
+        self.think_end_token = "</think>"
 
-        # for streaming
-        self.end_token_id = self.vocab.get("<|im_end|>")
-        self.non_reasoning_mode_start_token = tokenizer.encode("\n")[0]
-        self.function_call_role = ' -> tool/function_call\n'
-        self.no_reasoning_content = False
+        # for structured-output helpers (is_reasoning_end / extract_content_ids)
+        self.think_end_token_ids = tokenizer.encode(
+            self.think_end_token, add_special_tokens=False)
 
-        # for is_reasoning_end check
-        self.exact_think_end_strings = [
-            self.think_end_string_base + "\n",
-            self.think_end_string_base + self.function_call_role
-        ]
-        self.think_end_tokens = [tokenizer.encode(think_end_string) for think_end_string in self.exact_think_end_strings]
-
-        # attributes for streaming parser mixin
+        # streaming state (per-request; reset on stream start)
         self.buffer_string = ''
-        self.special_strings = [self.think_start_token, self.think_end_string_base, self.function_call_role]
-        self.escaped_special_strings = [re.escape(ss) for ss in self.special_strings]
-
+        self.reasoning_ended = False
+        # mixin uses special_strings for end-of-buffer partial matching
+        self.special_strings = [self.think_end_token, self.think_start_token]
 
     def extract_reasoning(
             self, model_output: str, request: ChatCompletionRequest
     ) -> tuple[Optional[str], Optional[str]]:
-        chat_template_kwargs = request.chat_template_kwargs or {}
+        end = self.think_end_token
+        if end in model_output:
+            reasoning, _, content = model_output.partition(end)
+            reasoning = reasoning.replace(self.think_start_token, '').strip('\n')
+            return (reasoning or None), (content.lstrip('\n') or None)
 
-        is_reasoning = False
-
-        if chat_template_kwargs.get('force_reasoning', False):
-            is_reasoning = True
-        # if both are True, prioritize force_reasoning
-        elif chat_template_kwargs.get('skip_reasoning', False):
-            return None, model_output
-
-        if model_output.startswith(self.think_start_token):
-            is_reasoning = True
-            model_output_parts = model_output.partition(self.think_start_token)
-            model_output = model_output_parts[2]
-
-        if self.think_end_string_base not in model_output:
-            if is_reasoning:
-                return model_output, None
-            else:
-                # auto tool choice case
-                if request.tool_choice == "auto" or request.tool_choice is None:
-                    if model_output.startswith('\n'):
-                        model_output = model_output[1:]
-                    return None, model_output
-                else: # others: 'required', 'named tool call'
-                    return None, model_output.replace(self.function_call_role, '')
-
-        reasoning_content, _, content = model_output.partition(self.think_end_string_base)
-
-        final_content = content or None
-
-        return reasoning_content, final_content
-
+        # </think> never appeared:
+        kwargs = request.chat_template_kwargs or {}
+        if kwargs.get('enable_thinking', False):
+            # thinking on but not closed (e.g. truncated) -> all reasoning
+            reasoning = model_output.replace(self.think_start_token, '').strip('\n')
+            return (reasoning or None), None
+        # thinking off -> all content (template renders an empty <think></think>)
+        return None, (model_output.lstrip('\n') or None)
 
     def extract_reasoning_streaming(
         self,
@@ -96,63 +69,53 @@ class HcxReasoningParser(ReasoningParser, HcxStreamingParserFunctionsMixin):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> Union[DeltaMessage, None]:
-        if current_token_ids and current_token_ids[0] == self.non_reasoning_mode_start_token:
-            self.no_reasoning_content = True
-            
-        if len(current_text) == 0:
-            return None
+        if not previous_text:
+            # new stream -> reset state (in case the instance is reused)
+            self.buffer_string = ''
+            self.reasoning_ended = False
 
-        if self.no_reasoning_content:
+        if self.reasoning_ended:
             return DeltaMessage(content=delta_text)
 
         self.buffer_string += delta_text
-        buffered_content = ''
 
-        if self.check_is_special_string():
-            if current_text.startswith(self.function_call_role):
-                self.no_reasoning_content = True
-                delta_text = self.buffer_string
-                self.buffer_string = ''
-                return DeltaMessage(content=delta_text)
+        end = self.think_end_token
+        if end in self.buffer_string:
+            before, _, after = self.buffer_string.partition(end)
+            self.buffer_string = ''
+            self.reasoning_ended = True
+            before = before.replace(self.think_start_token, '')
+            msg = {}
+            if before:
+                msg['reasoning_content'] = before
+            if after:
+                msg['content'] = after
+            return DeltaMessage(**msg) if msg else None
 
-            buffered_content, delta_text = self.remove_special_string()
-            self.buffer_string = delta_text
-            
-            if buffered_content:
-                # if buffered_content is not empty, the special string must be '<|im_end|>\n<|im_start|>assistant'
-                # which serves as the separator between reasoning content and other content
-                if self.check_is_part_of_special_string():
-                    return DeltaMessage(reasoning_content=buffered_content)
-                else:
-                    self.buffer_string = ''
-                    return DeltaMessage(reasoning_content=buffered_content, content=delta_text)
-
+        # </think> may be split across deltas: hold the tail until it resolves
         if self.check_is_part_of_special_string():
             return None
-        else:
-            delta_text = self.buffer_string
-            self.buffer_string = ''
 
-        if self.think_end_string_base in current_text:
-            return DeltaMessage(content=delta_text)
-        else:
-            return DeltaMessage(reasoning_content=delta_text)
-
+        out = self.buffer_string.replace(self.think_start_token, '')
+        self.buffer_string = ''
+        # ponytail: thinking-off + streaming has no per-stream request here, so
+        # output before any </think> is emitted as reasoning_content. Correct for
+        # the common thinking-on case; harmless for thinking-off (no </think> ever).
+        return DeltaMessage(reasoning_content=out) if out else None
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
-        if len(input_ids) > 1:
-            for think_end_tokens in self.think_end_tokens:
-                think_end_len = len(think_end_tokens)
-                if len(input_ids) >= think_end_len and input_ids[-think_end_len:] == think_end_tokens:
-                    return True
-
-            return False
-
-        return self.no_reasoning_content or self.end_token_id in input_ids
-
+        # </think> token sequence present? (structured output; best-effort)
+        ids = self.think_end_token_ids
+        n = len(ids)
+        if n == 0:
+            return True
+        return any(input_ids[i:i + n] == ids
+                   for i in range(len(input_ids) - n + 1))
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        if self.end_token_id not in input_ids[:-1]:
-            return []
-        else:
-            return input_ids[input_ids.index(self.end_token_id) + 1:]
+        ids = self.think_end_token_ids
+        n = len(ids)
+        for i in range(len(input_ids) - n + 1):
+            if input_ids[i:i + n] == ids:
+                return input_ids[i + n:]
+        return []
