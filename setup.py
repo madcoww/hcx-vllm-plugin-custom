@@ -7,6 +7,8 @@ def parse_requirements(filename):
 setup(name='vllm_add_hyperclovax_model',
       version='0.1',
       packages=find_packages(),
+      # 14B/32B 공용 챗 템플릿(루트의 *.jinja)을 sdist에 포함
+      data_files=[('.', ['chat_template_hcx.jinja'])],
       install_requires=parse_requirements("requirements.txt"),
       entry_points={
         'vllm.general_plugins': [

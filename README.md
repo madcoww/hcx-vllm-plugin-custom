@@ -1,37 +1,148 @@
 # HyperCLOVAX vLLM Plugin
 
-Implementation of architectural change on the LLaMA model:
-- [μP](https://arxiv.org/pdf/2203.03466) 
+HyperCLOVAX(HCX) 모델을 vLLM에서 서빙하기 위한 플러그인. LLaMA 구조에
+아래 변경을 적용한다.
+- [μP](https://arxiv.org/pdf/2203.03466)
 - [Peri-LN](https://arxiv.org/pdf/2502.02732)
 
-## Configuration
-- [configuration_hyperclovax.py](model/configuration_hyperclovax.py)
-  - μP args
-    - **embedding_multiplier** (`float`, optional, default: `None`) - Multiplier applied to the embedding weights. If `None`, it is equivalent to `1.0`.
-    - **logits_scaling** (`float`, optional, default: `None`) - Scaling factor for logits. If `None`, it is equivalent to `1.0`.
-    - **attention_multiplier** (`float`, optional, default: `None`) - Multiplier applied to the attention weights. If `None`, it is equivalent to `self.head_dim ** -0.5`.
-    - **residual_multiplier** (`float`, optional, default: `None`) - Scaling factor for residual connections. If `None`, it is equivalent to `1.0`.
-  - Peri-LN args
-    - **use_post_norm** (`bool`, optional, defaults to `False`) - Determines whether to apply Peri-Layer Normalization. Set to `True` to enable this feature.
+> **기준 버전:** vLLM **v0.20.0** (`--reasoning-parser` / `--tool-call-parser`
+> 인터페이스 및 `vllm.tool_parsers`, `vllm.entrypoints.openai.engine.protocol`
+> 경로 기준). 그 이하 버전은 모듈 경로가 달라 동작하지 않을 수 있다.
 
-## vLLM
-- [vllm_hyperclovax.py](model/vllm_hyperclovax.py)
-- Reasoning parser: [hcx_reasoner.py](parser/hcx_reasoner.py)
-- Tool parser: [hcx_tool_parser.py](parser/hcx_tool_parser.py)
+## 구성 요소
 
-### How to use vLLM ([Docs](https://docs.vllm.ai/en/latest/design/plugin_system.html))
-After install vllm, `pip install .` to register `HyperCLOVAXForCausalLM` on vllm package.
+| 구성 | 파일 | 등록 이름 |
+|------|------|-----------|
+| 모델 | [model/vllm_hyperclovax.py](model/vllm_hyperclovax.py) | `HyperCLOVAXForCausalLM` |
+| Reasoning 파서 | [parser/hcx_reasoner.py](parser/hcx_reasoner.py) | `hcx` |
+| Tool 파서 | [parser/hcx_tool_parser.py](parser/hcx_tool_parser.py) | `hcx` |
+| 챗 템플릿 (14B/32B 공용) | [chat_template_hcx.jinja](chat_template_hcx.jinja) | — |
 
-### Deploying with vLLM Docker Example ([Docs](https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html))
+`setup.py`의 `vllm.general_plugins` 엔트리포인트로 모델/파서가 자동 등록된다.
+**챗 템플릿은 자동 주입되지 않으므로** 기동 시 `--chat-template`로 지정해야 한다.
+
+## 모델 설정 (μP / Peri-LN)
+
+[configuration_hyperclovax.py](model/configuration_hyperclovax.py)
+
+- μP
+  - **embedding_multiplier** (`float`, default `None`) — 임베딩 가중치 배수. `None`이면 `1.0`.
+  - **logits_scaling** (`float`, default `None`) — 로짓 스케일. `None`이면 `1.0`.
+  - **attention_multiplier** (`float`, default `None`) — 어텐션 가중치 배수. `None`이면 `self.head_dim ** -0.5`.
+  - **residual_multiplier** (`float`, default `None`) — 잔차 연결 스케일. `None`이면 `1.0`.
+- Peri-LN
+  - **use_post_norm** (`bool`, default `False`) — Peri-Layer Normalization 적용 여부. `True`로 활성화.
+
+## 챗 템플릿 (14B/32B 공용)
+
+[chat_template_hcx.jinja](chat_template_hcx.jinja) 하나로 **14B / 32B 공용**이다.
+tool-call(`<tool_call>...`)·reasoning(`<think>...</think>`) 포맷이 두 모델에서
+동일하므로 본문은 같고, 생성 프롬프트의 thinking 분기만 통일했다.
+
+- **`enable_thinking`으로 통일** — 과거 32B 템플릿이 쓰던 `thinking` 변수 및
+  `is not defined` 기본 ON 분기를 제거하고 `{%- if enable_thinking %}` 형태로 일원화.
+- `enable_thinking` **미지정 시 thinking OFF**(빈 `<think></think>`)로 동작하며,
+  이는 `hcx_reasoner.py`의 `kwargs.get('enable_thinking', False)` 기본값과 일치한다.
+
+요청 시 `chat_template_kwargs={"enable_thinking": true}`로 thinking을 켤 수 있다.
+
+## Tool calling
+
+모델은 챗 템플릿이 지시한 아래 XML 포맷으로 함수 호출을 출력한다.
+
+```
+<tool_call>get_weather
+<arg_key>city</arg_key>
+<arg_value>서울</arg_value>
+</tool_call>
+```
+
+[hcx_tool_parser.py](parser/hcx_tool_parser.py)가 이 포맷을 OpenAI 호환
+`tool_calls`로 변환한다. `<arg_value>`는 문자열이면 원문, 그 외(숫자/불리언/객체)는
+JSON으로 들어오므로 `json.loads` 시도 후 실패하면 문자열로 복원한다. 문자열 인자
+하나만 담는 `<arguments>{json}</arguments>` 형태도 지원한다.
+
+## 설치
+
+```bash
+pip install .   # HyperCLOVAXForCausalLM 및 hcx 파서를 vLLM에 등록
+```
+
+## 서버 기동
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model <hcx-model-path> \
+    --reasoning-parser hcx \
+    --enable-auto-tool-choice --tool-call-parser hcx \
+    --chat-template ./chat_template_hcx.jinja
+```
+
+`--reasoning-parser hcx`를 함께 켜면 `<think>` 추론부는 reasoning 파서가
+처리하고, 추론이 끝난 뒤에야 tool 파서가 호출된다(중복 처리 없음).
+
+## Kubernetes 기동 (git clone 방식)
+
+repo를 클론해 `pip install -e .`로 설치하면 챗 템플릿도 클론 디렉터리에 함께
+들어오므로, `--chat-template`에 **클론 경로**(`/tmp/plugin/chat_template_hcx.jinja`)를
+그대로 지정한다. 별도 ConfigMap/볼륨 마운트가 필요 없다.
+
+> **EOS 토큰(`100273` 추가):** 모델의 `generation_config.json`을 직접 패치해야 한다
+> (`--override-generation-config` 플래그는 적용되지 않음). 모델 마운트가 RW일 때
+> vLLM 기동 **전에** 아래 멱등 패치를 실행한다. RO 마운트면 모델 빌드 단계에서 미리
+> 반영해야 한다.
+
+```yaml
+args:
+  - |
+    apt-get update && apt-get install -y git
+
+    cd /tmp
+    rm -rf plugin
+    git clone https://github.com/madcoww/hcx-vllm-plugin-custom.git plugin
+    cd plugin
+    pip install -e .
+
+    # generation_config.json에 EOS 100273 추가 (멱등; 이미 있으면 건너뜀)
+    python3 -c "import json,pathlib; p=pathlib.Path('/mnt/models/HyperCLOVAX-SEED-Think-14B/generation_config.json'); c=json.loads(p.read_text()); e=c.get('eos_token_id'); e=e if isinstance(e,list) else [e]; (100273 in e) or (c.update(eos_token_id=e+[100273]), p.write_text(json.dumps(c,ensure_ascii=False,indent=2)))"
+
+    python3 -m vllm.entrypoints.openai.api_server \
+      --model /mnt/models/HyperCLOVAX-SEED-Think-14B \
+      --served-model-name HyperCLOVAX-SEED-Think-14B \
+      --host 0.0.0.0 \
+      --port 8000 \
+      --gpu-memory-utilization 0.9 \
+      --tensor-parallel-size 2 \
+      --max-model-len 32768 \
+      --max-num-seqs 8 \
+      --reasoning-parser hcx \
+      --enable-auto-tool-choice \
+      --tool-call-parser hcx \
+      --disable-custom-all-reduce \
+      --chat-template /tmp/plugin/chat_template_hcx.jinja
+```
+
+## Docker 배포 ([Docs](https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html))
+
+`COPY .`로 챗 템플릿이 이미지 루트(`/workspace/HyperCLOVAX/`)에 함께 들어간다.
+
 ```bash
 docker build --tag vllm/vllm-openai-hyperclovax .
 docker run --runtime nvidia --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -p 8000:8000 \
-    vllm/vllm-openai-hyperclovax <args...>
+    vllm/vllm-openai-hyperclovax \
+    --model <hcx-model-path> \
+    --reasoning-parser hcx \
+    --enable-auto-tool-choice --tool-call-parser hcx \
+    --chat-template /workspace/HyperCLOVAX/chat_template_hcx.jinja
 ```
 
+> Docker도 마찬가지로 모델의 `generation_config.json`에 EOS `100273`을 직접 반영해야
+> 한다(위 멱등 패치 참고).
+
 ## License
+
 ```
 HyperCLOVAX vLLM Plugin
 Copyright (c) 2025-present NAVER Cloud Corp.

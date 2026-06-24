@@ -1,5 +1,5 @@
 # vllm docker: Please see https://hub.docker.com/r/vllm/vllm-openai/tags
-ARG VLLM_VERSION="v0.8.3"
+ARG VLLM_VERSION="v0.20.0"
 FROM vllm/vllm-openai:${VLLM_VERSION} AS vllm-base
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
