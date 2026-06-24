@@ -26,8 +26,8 @@ logger = init_logger(__name__)
 
 
 class HcxReasoningParser(ReasoningParser, HcxStreamingParserFunctionsMixin):
-    def __init__(self, tokenizer: PreTrainedTokenizerBase):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
+        super().__init__(tokenizer, *args, **kwargs)
         self.think_start_token = "/think\n"
         self.think_end_string_base = "<|im_end|>\n<|im_start|>assistant"
 

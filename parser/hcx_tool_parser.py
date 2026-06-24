@@ -24,8 +24,8 @@ from .hcx_parser_mixin import HcxStreamingParserFunctionsMixin
 logger = init_logger(__name__)
 
 class HcxToolParser(ToolParser, HcxStreamingParserFunctionsMixin):
-    def __init__(self, tokenizer: Any):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: Any, *args, **kwargs):
+        super().__init__(tokenizer, *args, **kwargs)
 
         self.tool_call_start_token: str = " -> tool/function_call\n"
         self.tool_call_end_token: str = "<|im_end|>"
