@@ -53,7 +53,8 @@ class HcxReasoningParser(ReasoningParser, HcxStreamingParserFunctionsMixin):
 
         # </think> never appeared:
         kwargs = request.chat_template_kwargs or {}
-        if kwargs.get('enable_thinking', False):
+        # 템플릿 기본값이 thinking ON(미지정=ON)이므로 폴백도 True로 맞춘다
+        if kwargs.get('enable_thinking', True):
             # thinking on but not closed (e.g. truncated) -> all reasoning
             reasoning = model_output.replace(self.think_start_token, '').strip('\n')
             return (reasoning or None), None
