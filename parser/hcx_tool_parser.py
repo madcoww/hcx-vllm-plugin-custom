@@ -3,10 +3,9 @@
 # Apache-2.0
 
 import json
-from collections.abc import Sequence
-from typing import Union, Any
-
 import re
+from collections.abc import Sequence
+from typing import Any, Union
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import (
@@ -23,76 +22,88 @@ from .hcx_parser_mixin import HcxStreamingParserFunctionsMixin
 
 logger = init_logger(__name__)
 
+
 class HcxToolParser(ToolParser, HcxStreamingParserFunctionsMixin):
+    """HCX SEED-Think 챗 템플릿이 내보내는 tool-call 포맷을 파싱한다(14B/32B 공통):
+
+        <tool_call>{함수명}
+        <arg_key>{키}</arg_key>
+        <arg_value>{값}</arg_value>
+        ...
+        </tool_call>
+
+    인자가 문자열 하나인 경우의 <arguments>{json}</arguments> 형태도 허용한다.
+    <think> 추론부는 HcxReasoningParser가 담당하므로, 이 파서는 추론이 끝난 뒤의
+    content만 받는다(vLLM이 is_reasoning_end 이후에만 tool 파서를 호출함).
+    """
+
     def __init__(self, tokenizer: Any, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
 
-        self.tool_call_start_token: str = " -> tool/function_call\n"
-        self.tool_call_end_token: str = "<|im_end|>"
-        # case 1. tool call is between other contents; case 2. tool call is at the end of the response
-        self.tool_call_regex = re.compile(r"-> tool/function_call\n(.*?)<\|im_end\|>|-> tool/function_call\n(.*)]", re.DOTALL)
-            
-        # for streaming
-        self.tool_call_offset = 0
+        self.tool_call_start_token: str = "<tool_call>"
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+        self.arguments_regex = re.compile(r"<arguments>(.*?)</arguments>", re.DOTALL)
+        self.arg_pair_regex = re.compile(
+            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+
+        # 스트리밍 상태 (vLLM이 요청마다 파서를 새로 생성한다)
         self.current_tool_id = -1
-        self.prev_tool_call_arr = []
-        self.streamed_args_for_tool: list[str] = []
-        self.is_reasoning_ended = False
-
-        # attributes for streaming parser mixin
         self.buffer_string = ''
-        self.special_strings = ['<|im_end|>\n', '<|im_start|>assistant', '-> tool/function_call\n']
-        self.escaped_special_strings = [re.escape(ss) for ss in self.special_strings]
+        # "<tool_call>"가 델타 경계에서 잘렸을 때 content로 흘리지 않도록 보류
+        self.special_strings = [self.tool_call_start_token]
 
+    @staticmethod
+    def _coerce(value: str) -> Any:
+        # 템플릿은 문자열 값은 원문 그대로, 그 외(숫자/불리언/객체)는 tojson으로 내보낸다.
+        # 따라서 json 파싱을 시도하고, 실패하면 원문 문자열로 둔다.
+        value = value.strip()
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+
+    def _parse_tool_call(self, block: str) -> tuple[str, str]:
+        """<tool_call>..</tool_call> 사이 블록 -> (함수명, arguments json 문자열)."""
+        name, _, body = block.partition('\n')
+        name = name.strip()
+
+        # <arguments> 형태면 그 안의 json 문자열을 그대로 사용
+        args_match = self.arguments_regex.search(body)
+        if args_match:
+            return name, args_match.group(1).strip()
+
+        # arg_key/arg_value 쌍을 순서대로 dict로 복원
+        obj = {k.strip(): self._coerce(v)
+               for k, v in self.arg_pair_regex.findall(body)}
+        return name, json.dumps(obj, ensure_ascii=False)
 
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        if self.tool_call_start_token in model_output:
-            try:
-                tool_call_match = self.tool_call_regex.search(model_output)
-                if tool_call_match:
-                    if tool_call_match.group(1) is not None:
-                        raw_function_calls = json.loads(tool_call_match.group(1))
-                    else:
-                        raw_function_calls = json.loads(tool_call_match.group(2) + ']')
+        if self.tool_call_start_token not in model_output:
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output)
+        try:
+            tool_calls = []
+            for block in self.tool_call_regex.findall(model_output):
+                name, arguments = self._parse_tool_call(block)
+                tool_calls.append(ToolCall(
+                    type="function",
+                    function=FunctionCall(name=name, arguments=arguments)))
 
-                tool_calls = [
-                    ToolCall(
-                        type="function",
-                        function=FunctionCall(
-                            name=function_call["name"],
-                            arguments=json.dumps(function_call["arguments"],
-                                                 ensure_ascii=False)))
-                    for function_call in raw_function_calls
-                ]
-                
-                # check if there is other content before tool calls
-                if '<|im_end|>\n<|im_start|>assistant -> tool/function_call\n' in model_output:
-                    content = model_output.split('<|im_end|>\n<|im_start|>assistant -> tool/function_call\n')[0]
-
-                    return ExtractedToolCallInformation(
-                        tools_called=True,
-                        tool_calls=tool_calls,
-                        content=content if content else None)
-                else:
-                    return ExtractedToolCallInformation(
-                        tools_called=True,
-                        tool_calls=tool_calls,
-                        content=None)
-
-            except Exception:
-                logger.exception("Error in extracting tool call from response.")
-
-                return ExtractedToolCallInformation(tools_called=False,
-                                                    tool_calls=[],
-                                                    content=model_output)
-        else:
-            return ExtractedToolCallInformation(tools_called=False,
-                                                tool_calls=[],
-                                                content=model_output)
+            # 첫 <tool_call> 앞의 텍스트는 일반 content로 처리
+            content = model_output[:model_output.find(
+                self.tool_call_start_token)].rstrip('\n')
+            return ExtractedToolCallInformation(
+                tools_called=bool(tool_calls),
+                tool_calls=tool_calls,
+                content=content or None)
+        except Exception:
+            logger.exception("Error in extracting tool call from response.")
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -105,71 +116,30 @@ class HcxToolParser(ToolParser, HcxStreamingParserFunctionsMixin):
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
         if self.tool_call_start_token in current_text:
-            function_call_text = current_text.split(self.tool_call_start_token)[-1]
-            function_call_text = function_call_text[self.tool_call_offset:]
-            opening_brace_index = function_call_text.find('{')
-
-            closing_brace_indices = [_idx for _idx, c in enumerate(function_call_text) if c == '}']
-
-            if opening_brace_index < 0:
+            # 지금까지 '완결된'(</tool_call>까지 닫힌) 블록만 대상으로 한다
+            blocks = self.tool_call_regex.findall(current_text)
+            pending = blocks[self.current_tool_id + 1:]
+            if not pending:
                 return None
 
-            if len(closing_brace_indices) == 0:
-                return None
+            # 이번 델타에서 새로 완결된 블록들을 한 번에 emit
+            deltas = []
+            for block in pending:
+                self.current_tool_id += 1
+                name, arguments = self._parse_tool_call(block)
+                deltas.append(DeltaToolCall(
+                    index=self.current_tool_id,
+                    type="function",
+                    id=f'hcx_tool_call_{self.current_tool_id}',
+                    function=DeltaFunctionCall(
+                        name=name, arguments=arguments).model_dump(
+                            exclude_none=True)))
+            return DeltaMessage(tool_calls=deltas)
 
-            for closing_brace_index in closing_brace_indices:
-                try:                        
-                    _function_call = json.loads(function_call_text[opening_brace_index: closing_brace_index + 1])
-                    self.current_tool_id += 1
-                    self.tool_call_offset = closing_brace_index
-                    self.prev_tool_call_arr.append(_function_call)
-                    self.streamed_args_for_tool.append(function_call_text[opening_brace_index:closing_brace_index + 1])
-
-                    return DeltaMessage(tool_calls=[
-                            DeltaToolCall(index=self.current_tool_id,
-                                            type="function",
-                                            id=f'hcx_tool_call_{self.current_tool_id}',
-                                            function=DeltaFunctionCall(
-                                                name=_function_call.get('name', ''), 
-                                                arguments=json.dumps(_function_call.get('arguments', ''))).model_dump(
-                                                    exclude_none=True))])
-
-                except json.JSONDecodeError:
-                    logger.debug('Decode error:', function_call_text[opening_brace_index: closing_brace_index + 1])
-                
+        # 아직 tool_call 없음: content로 흘리되, 잘린 "<tool_call>" 꼬리는 보류
+        self.buffer_string += delta_text
+        if self.check_is_part_of_special_string():
             return None
-        else:
-            # check if reasoning ended with three conditions
-            if len(current_token_ids) == 2 and len(current_text) == 0:
-                # there is no reasoning content
-                self.is_reasoning_ended = True
-
-            if current_text.startswith(' -> tool/function_call\n'):
-                self.is_reasoning_ended = True
-
-            if '<|im_end|>\n<|im_start|>' in current_text:
-                self.is_reasoning_ended = True
-
-            # set up buffer for special string processing
-            self.buffer_string += delta_text
-            buffered_content = ''
-
-            if self.check_is_special_string():
-                buffered_content, delta_text = self.remove_special_string()
-                self.buffer_string = delta_text
-
-                if self.is_reasoning_ended:
-                    return DeltaMessage(content=buffered_content)
-                else:
-                    return DeltaMessage(reasoning_content=buffered_content)
-
-            if self.check_is_part_of_special_string():
-                return None
-            else:
-                delta_text = self.buffer_string
-                self.buffer_string = ''
-
-            if self.is_reasoning_ended:
-                return DeltaMessage(content=delta_text)
-            else:
-                return DeltaMessage(reasoning_content=delta_text)
+        out = self.buffer_string
+        self.buffer_string = ''
+        return DeltaMessage(content=out) if out else None

@@ -1,2 +1,2 @@
 transformers>=4.52.4
-vllm>=0.8.5
+vllm>=0.20.0
