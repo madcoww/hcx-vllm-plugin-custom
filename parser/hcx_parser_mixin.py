@@ -19,11 +19,14 @@ class HcxStreamingParserFunctionsMixin:
         for ss in self.escaped_special_strings:
             positions += [(m.start(), m.end()) for m in re.finditer(ss, self.buffer_string)]
 
+        if not positions:
+            return self.buffer_string, ''
+
         sorted_positions = sorted(positions, key=lambda x: x[0])
         to_stream = self.buffer_string[:sorted_positions[-1][0]]
         remaining = self.buffer_string[sorted_positions[-1][1]:]
         for ss in self.special_strings:
-            to_stream.replace(ss, '')
+            to_stream = to_stream.replace(ss, '')
 
         return to_stream, remaining
 

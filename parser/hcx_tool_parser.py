@@ -107,17 +107,13 @@ class HcxToolParser(ToolParser, HcxStreamingParserFunctionsMixin):
         if self.tool_call_start_token in current_text:
             function_call_text = current_text.split(self.tool_call_start_token)[-1]
             function_call_text = function_call_text[self.tool_call_offset:]
-            opening_brace_index = None
-            for idx, c in enumerate(function_call_text):
-                if c == '{':
-                    opening_brace_index = idx
-                    break
-            
+            opening_brace_index = function_call_text.find('{')
+
             closing_brace_indices = [_idx for _idx, c in enumerate(function_call_text) if c == '}']
-            
-            if opening_brace_index is None:
+
+            if opening_brace_index < 0:
                 return None
-            
+
             if len(closing_brace_indices) == 0:
                 return None
 
